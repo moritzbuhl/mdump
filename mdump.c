@@ -48,6 +48,20 @@
 #include <unistd.h>
 #include <vis.h>
 
+struct object {
+	uintptr_t f;
+	char fname[PATH_MAX];
+	char *sname;
+	RB_ENTRY(object) entry;
+};
+
+struct malloc {
+	uintptr_t p;
+	size_t size;
+	struct object *obj;
+	RB_ENTRY(malloc) entry;
+};
+
 enum {
 	TIMESTAMP_NONE,
 	TIMESTAMP_ABSOLUTE,
@@ -60,23 +74,31 @@ char *tracefile = "ktrace.out";
 char *malloc_aout = "a.out";
 struct ktr_header ktr_header;
 pid_t pid_opt = -1;
+uintptr_t ptrtrace = 0;
+struct malloc *nmptr;
+RB_HEAD(objectshead, object) objects = RB_INITIALIZER(&objects);
+RB_HEAD(mallocshead, malloc) mallocs = RB_INITIALIZER(&mallocs);
 
 static int fread_tail(void *, size_t, size_t);
 
 static void ktruser(struct ktr_user *, size_t);
 static void usage(void);
 static void *xmalloc(size_t);
+RB_PROTOTYPE_STATIC(objectshead, object, entry, objectcmp)
+RB_PROTOTYPE_STATIC(mallocshead, malloc, entry, malloccmp)
 
 int
 main(int argc, char *argv[])
 {
 	int ch, silent;
-	size_t ktrlen, size;
+	size_t ktrlen;
 	int trpoints = KTRFAC_USER;
 	const char *errstr;
-	void *m;
+	char *endptr;
+	uint8_t m[KTR_USER_MAXLEN];
+	struct malloc *mptr;
 
-	while ((ch = getopt(argc, argv, "e:f:Dlp:")) != -1)
+	while ((ch = getopt(argc, argv, "e:f:Dlp:P:")) != -1)
 		switch (ch) {
 		case 'e':
 			malloc_aout = optarg;
@@ -95,6 +117,11 @@ main(int argc, char *argv[])
 			if (errstr)
 				errx(1, "-p %s: %s", optarg, errstr);
 			break;
+		case 'P':
+			ptrtrace = strtoull(optarg, &endptr, 16);
+			if (ptrtrace == 0 || endptr[0] != '\0')
+				errx(1, "-P %s: invalid", optarg);
+			break;
 		default:
 			usage();
 		}
@@ -104,7 +131,6 @@ main(int argc, char *argv[])
 	if (pledge("stdio rpath getpw", NULL) == -1)
 		err(1, "pledge");
 
-	m = xmalloc(size = 1025);
 	if (strcmp(tracefile, "-") != 0)
 		if (!freopen(tracefile, "r", stdin))
 			err(1, "%s", tracefile);
@@ -127,17 +153,6 @@ main(int argc, char *argv[])
 		}
 
 		ktrlen = ktr_header.ktr_len;
-		if (ktrlen > size) {
-			void *newm;
-
-			if (ktrlen == SIZE_MAX)
-				errx(1, "data too long");
-			newm = realloc(m, ktrlen+1);
-			if (newm == NULL)
-				err(1, "realloc");
-			m = newm;
-			size = ktrlen;
-		}
 		if (ktrlen && fread_tail(m, ktrlen, 1) == 0)
 			errx(1, "data too short");
 		if (silent)
@@ -146,15 +161,22 @@ main(int argc, char *argv[])
 			continue;
 		switch (ktr_header.ktr_type) {
 		case KTR_USER:
-			ktruser(m, ktrlen);
+			ktruser((struct ktr_user *)m, ktrlen);
 			break;
 		default:
-			printf("\n");
 			break;
 		}
 		if (tail)
 			(void)fflush(stdout);
 	}
+
+	if (!RB_EMPTY(&mallocs) && ptrtrace == 0) {
+		printf("Leaks detected:\n");
+		RB_FOREACH(mptr, mallocshead, &mallocs)
+			printf("%p: %zu bytes at %s", (void *)mptr->p,
+			    mptr->size, mptr->obj->sname);
+	}
+		
 	exit(0);
 }
 
@@ -174,115 +196,146 @@ fread_tail(void *buf, size_t size, size_t num)
  * Base Formatters
  */
 
-struct stackframe {
-	void *caller;
-	void *object;
-};
-
-#define NUM_FRAMES	4
-struct malloc_utrace {
-	struct stackframe backtrace[NUM_FRAMES];
-	size_t sum;
-	size_t count;
-};
-
-struct malloc_object {
-	void *object;
-	char name[0];
-};
-
-struct objectnode {
-	RBT_ENTRY(objectnode) entry;
-	struct malloc_object *o;
-};
-
-
 static int
-objectcmp(const struct objectnode *e1, const struct objectnode *e2)
+objectcmp(const struct object *o1, const struct object *o2)
 {
-	return e1->o->object < e2->o->object ? -1 :
-	    e1->o->object > e2->o->object;
+	return o1->f < o2->f ? -1 : o1->f > o2->f;
 }
 
-RBT_HEAD(objectshead, objectnode) objects = RBT_INITIALIZER(&objectnode);
-RBT_PROTOTYPE(objectshead, objectnode, entry, objectcmp)
-RBT_GENERATE(objectshead, objectnode, entry, objectcmp);
+static int
+malloccmp(const struct malloc *m1, const struct malloc *m2)
+{
+	return m1->p < m2->p ? -1 : m1->p > m2->p;
+}
 
 void addr2line(const char *object, uintptr_t addr, char **name);
 
 static void
 ktruser(struct ktr_user *usr, size_t len)
 {
+	uint8_t *u = (uint8_t *)(usr + 1);
+	struct object *obj, osearch;
+	struct malloc *mptr, msearch;
+
 	if (len < sizeof(struct ktr_user))
 		errx(1, "invalid ktr user length %zu", len);
 	len -= sizeof(struct ktr_user);
 
+#if 0
 	if (dump == 1) {
 		if (strcmp(usr->ktr_id, "mallocdumpline") == 0)
 			printf("%.*s", (int)len, (unsigned char *)(usr + 1));
 		return;
 	}
+#endif
 
-	if (strcmp(usr->ktr_id, "mallocdumpline") == 0)
+	if (strcmp(usr->ktr_id, "malloctrobject") == 0) {
+		uintptr_t offptr;
+
+		memcpy(&(osearch.f), u, sizeof(osearch.f));
+		u += sizeof(osearch.f);
+		len -= sizeof(osearch.f);
+		if (RB_FIND(objectshead, &objects, &osearch) != NULL)
+			return;
+		obj = xmalloc(sizeof(*obj));
+		obj->f = osearch.f;
+		memcpy(&offptr, u, sizeof(offptr));
+		u += sizeof(offptr);
+		len -= sizeof(obj->f);
+		if (len > sizeof(obj->fname))
+			errx(1, "Invalid path size");
+		memcpy(obj->fname, u, len);
+		obj->fname[len] = '\0';
+		addr2line(len == 0 ? malloc_aout : obj->fname, offptr,
+		    &(obj->sname));
+		RB_INSERT(objectshead, &objects, obj);
 		return;
+	}
 
-	if (strcmp(usr->ktr_id, "mallocleakrecord") == 0 &&
-	    len == sizeof(struct malloc_utrace)) {
-		struct malloc_utrace u;
-		int i;
+	if (strcmp(usr->ktr_id, "malloc") == 0) {
+		size_t size;
 
-		memcpy(&u, usr + 1, sizeof(u));
-		printf("Leak sum=%zu count=%zu avg=%zu\n", u.sum, u.count,
-		    u.sum / u.count);
-		for (i = 0; i < NUM_FRAMES; i++) {
-			if (u.backtrace[i].caller) {
-				struct objectnode key, *obj;
-				char *name;
-				char *function;
+		memcpy(&(msearch.p), u, sizeof(msearch.p));
+		u += sizeof(msearch.p);
+		len -= sizeof(msearch.p);
 
-				key.o = xmalloc(sizeof(struct objectnode));
-				key.o->object = u.backtrace[i].object;
-				obj = RBT_FIND(objectshead, &objects, &key);
-				name = (obj != NULL && obj->o != NULL &&
-				    obj->o->name[0] != '\0') ? obj->o->name :
-				    malloc_aout;
-				addr2line(name, (uintptr_t)u.backtrace[i].
-				    caller, &function);
-				printf(" %s", function);
-				free(key.o);
-				free(function);
-			} else
-				break;
+		memcpy(&size, u, sizeof(size));
+		u += sizeof(size);
+		len -= sizeof(size);
+		if (RB_FIND(mallocshead, &mallocs, &msearch) != NULL) {
+			warnx("Duplicate malloc found: %p", msearch.p);
+			return;
 		}
-		printf("\n");
+
+		mptr = xmalloc(sizeof(*mptr));
+		mptr->p = msearch.p;
+		mptr->size = size;
+		memcpy(&(osearch.f), u, sizeof(osearch.f));
+		mptr->obj = RB_FIND(objectshead, &objects, &osearch);
+		RB_INSERT(mallocshead, &mallocs, mptr);
+		if (mptr->p == ptrtrace)
+			printf("%p = malloc(%zu): %s", (void *)mptr->p, mptr->size,
+			    mptr->obj->sname);
+			
+		return;
+	}
+	if (strcmp(usr->ktr_id, "realloc") == 0) {
+		uintptr_t newptr;
+		size_t size;
+
+		memcpy(&newptr, u, sizeof(newptr));
+		u += sizeof(newptr);
+		len -= sizeof(newptr);
+		memcpy(&(msearch.p), u, sizeof(msearch.p));
+		u += sizeof(msearch.p);
+		len -= sizeof(msearch.p);
+		memcpy(&(size), u, sizeof(size));
+		u += sizeof(size);
+		len -= sizeof(size);
+		memcpy(&(osearch.f), u, sizeof(osearch.f));
+		obj = RB_FIND(objectshead, &objects, &osearch);
+		if ((mptr = RB_FIND(mallocshead, &mallocs, &msearch)) == NULL) {
+			if (obj == NULL)
+				warnx("realloc ptr %p not found",
+				    (void *)msearch.p);
+			else
+				warnx("realloc ptr %p not found: %s",
+				    (void *)msearch.p, obj->sname);
+			mptr = xmalloc(sizeof(*mptr));
+		} else
+			RB_REMOVE(mallocshead, &mallocs, mptr);
+		if (newptr == ptrtrace || msearch.p == ptrtrace)
+			printf("%p = realloc(%p, %zu): %s", (void *)newptr,
+			    (void *)msearch.p, size, obj->sname);
+		mptr->size = size;
+		mptr->p = newptr;
+		mptr->obj = obj;
+		RB_INSERT(mallocshead, &mallocs, mptr);
 		return;
 	}
 
-	if (strcmp(usr->ktr_id, "mallocobjectrecord") == 0 &&
-	    len > sizeof(struct malloc_object) &&
-	    len <= sizeof(struct malloc_object) + PATH_MAX) {
-		union {
-			struct malloc_object m;
-			char data[sizeof(struct malloc_object) + PATH_MAX];
-		} u;
-		struct objectnode *p;
+	if (strcmp(usr->ktr_id, "free") == 0) {
+		memcpy(&(msearch.p), u, sizeof(msearch.p));
+		u += sizeof(msearch.p);
+		len -= sizeof(msearch.p);
+		memcpy(&(osearch.f), u, sizeof(osearch.f));
+		obj = RB_FIND(objectshead, &objects, &osearch);
 
-		memcpy(&u, usr + 1, len);
-		/* it should be, better make sure p->name is NUL terminated */
-		u.data[len - 1] = '\0';
-		if (strlen(u.m.name) + 1 != len - sizeof(struct malloc_object))
-			errx(1, "internal error");
-		p = xmalloc(sizeof(struct objectnode));
-		p->o = xmalloc(len);
-		p->o->object = u.m.object;
-		strlcpy(p->o->name, u.m.name,
-		    len - sizeof(struct malloc_object));
-		RBT_INSERT(objectshead, &objects, p);
+		if ((mptr = RB_FIND(mallocshead, &mallocs, &msearch)) == NULL) {
+			if ((obj) == NULL)
+				warnx("free ptr %p not found", (void *)msearch.p);
+			else
+				warnx("free ptr %p not found: %s", (void *)msearch.p, obj->sname);
+				
+			return;
+		}
+		if (mptr->p == ptrtrace)
+			printf("free(%p): %s", (void *)mptr->p, obj->sname);
+
+		RB_REMOVE(mallocshead, &mallocs, mptr);
+		free(mptr);
 		return;
 	}
-
-	printf("unknown malloc record %*.s %zu\n", KTR_USER_MAXIDLEN,
-	    usr->ktr_id, len);
 }
 
 static void
@@ -306,3 +359,5 @@ xmalloc(size_t sz)
 	return p;
 }
 
+RB_GENERATE_STATIC(objectshead, object, entry, objectcmp);
+RB_GENERATE_STATIC(mallocshead, malloc, entry, malloccmp);
