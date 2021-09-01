@@ -58,7 +58,7 @@ struct object {
 struct malloc {
 	uintptr_t p;
 	size_t size;
-	struct object *obj;
+	struct object *obj[200];
 	RB_ENTRY(malloc) entry;
 };
 
@@ -172,9 +172,12 @@ main(int argc, char *argv[])
 
 	if (!RB_EMPTY(&mallocs) && ptrtrace == 0) {
 		printf("Leaks detected:\n");
-		RB_FOREACH(mptr, mallocshead, &mallocs)
-			printf("%p: %zu bytes at %s", (void *)mptr->p,
-			    mptr->size, mptr->obj->sname);
+		RB_FOREACH(mptr, mallocshead, &mallocs) {
+			printf("%p: %zu bytes at\n", (void *)mptr->p,
+			    mptr->size);
+			for (int i = 0; mptr->obj[i] != NULL; i++)
+				printf("\t%s", mptr->obj[i]->sname);
+		}
 	}
 		
 	exit(0);
@@ -254,6 +257,7 @@ ktruser(struct ktr_user *usr, size_t len)
 
 	if (strcmp(usr->ktr_id, "malloc") == 0) {
 		size_t size;
+		int i = 0;
 
 		memcpy(&(msearch.p), u, sizeof(msearch.p));
 		u += sizeof(msearch.p);
@@ -270,18 +274,26 @@ ktruser(struct ktr_user *usr, size_t len)
 		mptr = xmalloc(sizeof(*mptr));
 		mptr->p = msearch.p;
 		mptr->size = size;
-		memcpy(&(osearch.f), u, sizeof(osearch.f));
-		mptr->obj = RB_FIND(objectshead, &objects, &osearch);
+		while (len > 0) {
+			memcpy(&(osearch.f), u, sizeof(osearch.f));
+			obj = RB_FIND(objectshead, &objects, &osearch);
+			u += sizeof(osearch.f);
+			len -= sizeof(osearch.f);
+			mptr->obj[i] = obj;
+			i++;
+		}
+		mptr->obj[i] = NULL;
 		RB_INSERT(mallocshead, &mallocs, mptr);
 		if (mptr->p == ptrtrace)
 			printf("%p = malloc(%zu): %s", (void *)mptr->p, mptr->size,
-			    mptr->obj->sname);
+			    mptr->obj[0]->sname);
 			
 		return;
 	}
 	if (strcmp(usr->ktr_id, "realloc") == 0) {
 		uintptr_t newptr;
 		size_t size;
+		int i = 0;
 
 		memcpy(&newptr, u, sizeof(newptr));
 		u += sizeof(newptr);
@@ -292,25 +304,27 @@ ktruser(struct ktr_user *usr, size_t len)
 		memcpy(&(size), u, sizeof(size));
 		u += sizeof(size);
 		len -= sizeof(size);
-		memcpy(&(osearch.f), u, sizeof(osearch.f));
-		obj = RB_FIND(objectshead, &objects, &osearch);
 		if ((mptr = RB_FIND(mallocshead, &mallocs, &msearch)) == NULL) {
-			if (obj == NULL)
-				warnx("realloc ptr %p not found",
-				    (void *)msearch.p);
-			else
-				warnx("realloc ptr %p not found: %s",
-				    (void *)msearch.p, obj->sname);
 			mptr = xmalloc(sizeof(*mptr));
 		} else
 			RB_REMOVE(mallocshead, &mallocs, mptr);
-		if (newptr == ptrtrace || msearch.p == ptrtrace)
-			printf("%p = realloc(%p, %zu): %s", (void *)newptr,
-			    (void *)msearch.p, size, obj->sname);
+
 		mptr->size = size;
 		mptr->p = newptr;
-		mptr->obj = obj;
+		while (len > 0) {
+			memcpy(&(osearch.f), u, sizeof(osearch.f));
+			obj = RB_FIND(objectshead, &objects, &osearch);
+			u += sizeof(osearch.f);
+			len -= sizeof(osearch.f);
+			mptr->obj[i] = obj;
+			i++;
+		}
+		mptr->obj[i] = NULL;
 		RB_INSERT(mallocshead, &mallocs, mptr);
+
+		if (newptr == ptrtrace || msearch.p == ptrtrace)
+			printf("%p = realloc(%p, %zu): %s", (void *)newptr,
+			    (void *)msearch.p, size, mptr->obj[0]->sname);
 		return;
 	}
 

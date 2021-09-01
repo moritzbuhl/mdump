@@ -68,6 +68,8 @@ struct CU {
 	Dwarf_Debug dbg;
 };
 
+void addr2line(const char *, uintptr_t, char **);
+
 static int demangle = 1, func = 1, base, inlines, print_addr, pretty_print = 1;
 static char unknown[] = { '?', '?', '\0' };
 static Dwarf_Addr section_base;
