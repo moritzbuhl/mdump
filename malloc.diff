@@ -1,44 +1,92 @@
+Copyright (c) 2022 Martijn van Duren <martijn_openbsd@imperialat.at>
+
+Otto's recent changes made the diff not apply anymore.
+I assume you're still interested, so here's an updated version I made to
+accommodate my needs for a new filter-dkimverify I'm working on.
+
+The mdump tool now also shows the maximum memory usage (as far as the
+malloc interface is concerned) and allows you to stop processing as soon
+as a certain memory threshold has been reached (convenient for tracing
+when something isn't leaked, but takes up more memory than expected)
+
+Still a "quick and dirty" tool, but it helped me out.
+
+martijn@
+
+Index: hidden/dlfcn.h
+===================================================================
+RCS file: /cvs/src/lib/libc/hidden/dlfcn.h,v
+retrieving revision 1.4
+diff -u -p -r1.4 dlfcn.h
+--- hidden/dlfcn.h	9 Oct 2020 16:31:03 -0000	1.4
++++ hidden/dlfcn.h	30 Mar 2022 13:23:56 -0000
+@@ -22,9 +22,9 @@
+ 
+ PROTO_NORMAL(dladdr);
+ PROTO_DEPRECATED(dlclose);
+-PROTO_DEPRECATED(dlerror);
++PROTO_NORMAL(dlerror);
+ PROTO_DEPRECATED(dlopen);
+-PROTO_DEPRECATED(dlsym);
++PROTO_NORMAL(dlsym);
+ PROTO_NORMAL(dlctl);
+ 
+ #endif /* _LIBC_DLFCN_H_ */
+Index: stdlib/Makefile.inc
+===================================================================
+RCS file: /cvs/src/lib/libc/stdlib/Makefile.inc,v
+retrieving revision 1.64
+diff -u -p -r1.64 Makefile.inc
+--- stdlib/Makefile.inc	16 Dec 2017 20:06:55 -0000	1.64
++++ stdlib/Makefile.inc	30 Mar 2022 13:23:56 -0000
+@@ -25,6 +25,11 @@ SRCS+=	abs.c div.c labs.c ldiv.c
+ SRCS+=	abs.c div.c labs.c ldiv.c
+ .endif
+ 
++.ifdef MALLOC_STATS
++CFLAGS+=-I/usr/include/c++/v1
++CFLAGS+=-DMALLOC_STATS
++.endif
++
+ MAN+=	a64l.3 abort.3 abs.3 alloca.3 atexit.3 atof.3 atoi.3 atol.3 atoll.3 \
+ 	bsearch.3 div.3 ecvt.3 exit.3 getenv.3 getopt.3 getopt_long.3 \
+ 	getsubopt.3 hcreate.3 imaxabs.3 imaxdiv.3 insque.3 labs.3 ldiv.3 \
 Index: stdlib/malloc.c
 ===================================================================
 RCS file: /cvs/src/lib/libc/stdlib/malloc.c,v
-retrieving revision 1.271
-diff -u -p -r1.271 malloc.c
---- stdlib/malloc.c	23 Jul 2021 18:04:28 -0000	1.271
-+++ stdlib/malloc.c	31 Aug 2021 19:59:10 -0000
-@@ -23,7 +23,7 @@
-  * can buy me a beer in return. Poul-Henning Kamp
-  */
- 
--/* #define MALLOC_STATS */
-+#define MALLOC_STATS
- 
- #include <sys/types.h>
- #include <sys/queue.h>
-@@ -40,6 +40,9 @@
+retrieving revision 1.273
+diff -u -p -r1.273 malloc.c
+--- stdlib/malloc.c	26 Feb 2022 16:14:42 -0000	1.273
++++ stdlib/malloc.c	30 Mar 2022 13:23:56 -0000
+@@ -39,8 +39,13 @@
+ #include <unistd.h>
  
  #ifdef MALLOC_STATS
++#include <sys/atomic.h>
  #include <sys/tree.h>
 +#include <sys/param.h>
 +#include <sys/ktrace.h>
 +#include <dlfcn.h>
  #include <fcntl.h>
++#include <libunwind.h>
  #endif
  
-@@ -206,6 +209,7 @@ struct malloc_readonly {
+ #include "thread_private.h"
+@@ -223,6 +228,7 @@ struct malloc_readonly {
  	size_t	malloc_guard;		/* use guard pages after allocations? */
  #ifdef MALLOC_STATS
  	int	malloc_stats;		/* dump statistics at end */
 +	int	malloc_trace;		/* are we tracing? */
  #endif
- 	u_int32_t malloc_canary;	/* Matched against ones in malloc_pool */
+ 	u_int32_t malloc_canary;	/* Matched against ones in pool */
  };
-@@ -326,6 +330,97 @@ getrbyte(struct dir_info *d)
+@@ -343,6 +349,102 @@ getrbyte(struct dir_info *d)
  	return x;
  }
  
 +#ifdef MALLOC_STATS
 +struct traceobject {
-+	void *f;
++	uintptr_t f;
 +	RB_ENTRY(traceobject) entry;
 +};
 +
@@ -52,22 +100,28 @@ diff -u -p -r1.271 malloc.c
 +RB_PROTOTYPE_STATIC(traceobjecttree, traceobject, entry,
 +    omalloc_traceobjectcmp);
 +RB_GENERATE_STATIC(traceobjecttree, traceobject, entry, omalloc_traceobjectcmp);
-+int __realpath(const char *pathname, char *resolved);
-+PROTO_NORMAL(__realpath);
 +
 +static size_t
-+omalloc_traceobjectfmt(void *f, uint8_t *addr)
++omalloc_traceobjectfmt(uintptr_t f, uint8_t *addr)
 +{
 +	Dl_info info;
 +	size_t len;
-+	char path[PATH_MAX];
++	char *error;
++	uint8_t errstr[KTR_USER_MAXLEN];
 +
-+	if (dladdr(f, &info) == 0)
++	if (dladdr((void *)f, &info) == 0) {
++		memcpy(errstr, &f, sizeof(f));
++		len = sizeof(uintptr_t);
++		error = dlerror();
++		len += strlcpy(errstr + sizeof(uintptr_t), error,
++		    sizeof(errstr) - sizeof(uintptr_t));
++		utrace("malloctrobjecterr", errstr, len);
 +		return 0;
++	}
 +
 +	memcpy(addr, &f, sizeof(f));
 +	len = sizeof(f);
-+	f = (void *)((uintptr_t)f - (uintptr_t)info.dli_fbase);
++	f -= (uintptr_t)info.dli_fbase;
 +	memcpy(addr + len, &f, sizeof(f));
 +	len += sizeof(f);
 +	/*
@@ -84,7 +138,7 @@ diff -u -p -r1.271 malloc.c
 +void _spinunlock(volatile _atomic_lock_t *);
 +
 +static void
-+omalloc_traceobject(void *f)
++omalloc_traceobject(uintptr_t f)
 +{
 +	static struct traceobjecttree traceobjecttree =
 +	    RB_INITIALIZER(&traceobjecttree);
@@ -95,7 +149,7 @@ diff -u -p -r1.271 malloc.c
 +	size_t tracelen;
 +	static volatile _atomic_lock_t lock = 0;
 +
-+	search.f = f;
++	search.f = (uintptr_t)f;
 +
 +	/*
 +	 * Don't use per dir_info locking, since that would give a maximum of
@@ -104,9 +158,8 @@ diff -u -p -r1.271 malloc.c
 +	_spinlock(&lock);
 +	if (RB_FIND(traceobjecttree, &traceobjecttree, &search) != NULL)
 +		goto out;
-+	if ((tracelen = omalloc_traceobjectfmt(f, tracemem)) == 0)
-+		goto out;
-+	utrace("malloctrobject", tracemem, tracelen);
++	if ((tracelen = omalloc_traceobjectfmt(f, tracemem)) != 0)
++		utrace("malloctrobject", tracemem, tracelen);
 +
 +	if (tobjs == NULL || (ntobjs + 1) * sizeof(*tobjs) >= MALLOC_PAGESIZE) {
 +		/*
@@ -120,7 +173,7 @@ diff -u -p -r1.271 malloc.c
 +		ntobjs = 0;
 +	}
 +	tobj = &(tobjs[ntobjs++]);
-+	tobj->f = f;
++	tobj->f = (uintptr_t)f;
 +	RB_INSERT(traceobjecttree, &traceobjecttree, tobj);
 +out:
 +	_spinunlock(&lock);
@@ -130,16 +183,7 @@ diff -u -p -r1.271 malloc.c
  static void
  omalloc_parseopt(char opt)
  {
-@@ -361,7 +456,7 @@ omalloc_parseopt(char opt)
- 	case 'D':
- 		mopts.malloc_stats = 1;
- 		break;
--#endif /* MALLOC_STATS */
-+#endif
- 	case 'f':
- 		mopts.malloc_freecheck = 0;
- 		mopts.malloc_freeunmap = 0;
-@@ -390,6 +485,14 @@ omalloc_parseopt(char opt)
+@@ -407,6 +509,14 @@ omalloc_parseopt(char opt)
  	case 'R':
  		mopts.malloc_realloc = 1;
  		break;
@@ -154,138 +198,69 @@ diff -u -p -r1.271 malloc.c
  	case 'u':
  		mopts.malloc_freeunmap = 0;
  		break;
-@@ -1117,7 +1220,142 @@ free_bytes(struct dir_info *d, struct re
+@@ -1207,7 +1317,73 @@ free_bytes(struct dir_info *d, struct re
  	LIST_INSERT_HEAD(mp, info, entries);
  }
  
 +#ifdef MALLOC_STATS
-+
-+#define FRAME(depth)							\
-+	case depth:							\
-+		/* Requires -fno-omit-frame-pointer or risk segfault */	\
-+		if (__builtin_frame_address(depth + 1) == NULL)		\
-+			return NULL;					\
-+		return __builtin_return_address(depth);
-+
-+/* Ugly hack untill we have something like backtace(3) */
-+void *
-+omalloc_backtrace(int depth)
++uintptr_t *
++omalloc_backtrace(uintptr_t *bt, size_t nelem)
 +{
-+	/* We return based on parents perspective */
-+	switch (depth + 1) {
-+	FRAME(1)
-+	FRAME(2)
-+	FRAME(3)
-+	FRAME(4)
-+	FRAME(5)
-+	FRAME(6)
-+	FRAME(7)
-+	FRAME(8)
-+	FRAME(9)
-+	FRAME(10)
-+	FRAME(11)
-+	FRAME(12)
-+	FRAME(13)
-+	FRAME(14)
-+	FRAME(15)
-+	FRAME(16)
-+	FRAME(17)
-+	FRAME(18)
-+	FRAME(19)
-+	FRAME(20)
-+	FRAME(21)
-+	FRAME(22)
-+	FRAME(23)
-+	FRAME(24)
-+	FRAME(25)
-+	FRAME(26)
-+	FRAME(27)
-+	FRAME(28)
-+	FRAME(29)
-+	FRAME(30)
-+	FRAME(31)
-+	FRAME(32)
-+	FRAME(33)
-+	FRAME(34)
-+	FRAME(35)
-+	FRAME(36)
-+	FRAME(37)
-+	FRAME(38)
-+	FRAME(39)
-+	FRAME(40)
-+	FRAME(41)
-+	FRAME(42)
-+	FRAME(43)
-+	FRAME(44)
-+	FRAME(45)
-+	FRAME(46)
-+	FRAME(47)
-+	FRAME(48)
-+	FRAME(49)
-+	FRAME(50)
-+	FRAME(51)
-+	FRAME(52)
-+	FRAME(53)
-+	FRAME(54)
-+	FRAME(55)
-+	FRAME(56)
-+	FRAME(57)
-+	FRAME(58)
-+	FRAME(59)
-+	FRAME(60)
-+	FRAME(61)
-+	FRAME(62)
-+	FRAME(63)
-+	FRAME(64)
-+	FRAME(65)
-+	FRAME(66)
-+	FRAME(67)
-+	FRAME(68)
-+	FRAME(69)
-+	FRAME(70)
-+	FRAME(71)
-+	FRAME(72)
-+	FRAME(73)
-+	FRAME(74)
-+	FRAME(75)
-+	FRAME(76)
-+	FRAME(77)
-+	FRAME(78)
-+	FRAME(79)
-+	FRAME(80)
-+	FRAME(81)
-+	FRAME(82)
-+	FRAME(83)
-+	FRAME(84)
-+	FRAME(85)
-+	FRAME(86)
-+	FRAME(87)
-+	FRAME(88)
-+	FRAME(89)
-+	/* Should be deep enough, else rinse and repeat */
-+	default:
-+		return NULL;
++	static int (*u_getcontext)(unw_context_t *) = NULL;
++	static int (*u_init_local)(unw_cursor_t *, unw_context_t *) = NULL;
++	static int (*u_step)(unw_cursor_t *) = NULL;
++	static int (*u_get_reg)(unw_cursor_t *, unw_regnum_t, unw_word_t *) = NULL;
++	static volatile unsigned int lock = 0;
++	unw_context_t uc;
++	unw_cursor_t cursor;
++	unw_word_t ip, sp;
++	size_t i;
++
++	if (u_getcontext == NULL) {
++		u_getcontext = dlsym(RTLD_DEFAULT, "unw_getcontext");
++		u_init_local = dlsym(RTLD_DEFAULT, "unw_init_local");
++		u_step = dlsym(RTLD_DEFAULT, "unw_step");
++		u_get_reg = dlsym(RTLD_DEFAULT, "unw_get_reg");
++		if (u_getcontext == NULL || u_init_local == NULL ||
++		    u_step == NULL || u_get_reg == NULL) {
++			u_getcontext = NULL;
++			u_init_local = NULL;
++			u_step = NULL;
++			u_get_reg = NULL;
++		}
 +	}
++ 
++	if (u_getcontext != NULL) {
++		/* Make sure we don't recurse back from libunwind */
++		/* XXX This should probably thread local */
++		if (atomic_cas_uint(&lock, 0, 1) != 0)
++			goto builtin;
++		u_getcontext(&uc);
++		u_init_local(&cursor, &uc);
++		u_step(&cursor);
++		for (i = 0; u_step(&cursor) > 0 && nelem > 0; i++) {
++			u_get_reg(&cursor, UNW_REG_IP, &ip);
++			bt[i] = (uintptr_t)ip;
++			omalloc_traceobject(bt[i]);
++			nelem--;
++		}
++		lock = 0;
++		return &(bt[i]);
++	}
++
++ builtin:
++	bt[0] = (uintptr_t)__builtin_return_address(1);
++	omalloc_traceobject(bt[0]);
++	if (nelem > 1) {
++		bt[1] = (uintptr_t)__builtin_return_address(2);
++		omalloc_traceobject(bt[1]);
++		return &(bt[2]);
++		
++	}
++	/* Return address after last element so we can subtract easily */
++	return &(bt[1]);
 +}
  
-+uintptr_t *
-+omalloc_fillbt(uintptr_t *bt, size_t nelem)
-+{
-+	/* We can skip at least our direct invoker */
-+	size_t i = 0;
-+	void *fn = NULL;
-+	int depth = 1;
-+
-+	do {
-+		fn = omalloc_backtrace(depth++);
-+		omalloc_traceobject(fn);
-+		bt[i++] = (uintptr_t)fn;
-+	} while (fn != NULL && i < nelem);
-+
-+	/* Return address after last element so we can subtract easily */
-+	return &(bt[i]);
-+}
-+
 +/* XXX Maybe put this in something like omalloctrace.h? */
 +#define MAX_BACKTRACE(used) ((KTR_USER_MAXLEN - (used)) / sizeof(uintptr_t))
 +struct malloc_trace {
@@ -297,12 +272,11 @@ diff -u -p -r1.271 malloc.c
  
  static void *
  omalloc(struct dir_info *pool, size_t sz, int zero_fill, void *f)
-@@ -1277,11 +1515,28 @@ malloc(size_t size)
- {
+@@ -1389,10 +1565,27 @@ malloc(size_t size)
  	void *r;
  	struct dir_info *d;
-+#ifdef MALLOC_STATS
  	int saved_errno = errno;
++#ifdef MALLOC_STATS
 +	struct malloc_trace trace;
 +	uintptr_t *bt = trace.bt;
 +#endif
@@ -316,7 +290,7 @@ diff -u -p -r1.271 malloc.c
 +		saved_errno = errno;
 +		trace.p = (uintptr_t)r;
 +		trace.sz = size;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("malloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -326,12 +300,11 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  /*DEF_STRONG(malloc);*/
-@@ -1291,11 +1546,28 @@ malloc_conceal(size_t size)
- {
+@@ -1403,10 +1596,27 @@ malloc_conceal(size_t size)
  	void *r;
  	struct dir_info *d;
-+#ifdef MALLOC_STATS
  	int saved_errno = errno;
++#ifdef MALLOC_STATS
 +	struct malloc_trace trace;
 +	uintptr_t *bt = trace.bt;
 +#endif
@@ -345,7 +318,7 @@ diff -u -p -r1.271 malloc.c
 +		saved_errno = errno;
 +		trace.p = (uintptr_t)r;
 +		trace.sz = size;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("malloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -355,7 +328,7 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  DEF_WEAK(malloc_conceal);
-@@ -1448,16 +1720,35 @@ ofree(struct dir_info **argpool, void *p
+@@ -1562,16 +1772,35 @@ ofree(struct dir_info **argpool, void *p
  	}
  }
  
@@ -382,7 +355,7 @@ diff -u -p -r1.271 malloc.c
 +#ifdef MALLOC_STATS
 +	if (mopts.malloc_trace) {
 +		trace.p = (uintptr_t)ptr;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("free", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +	}
@@ -391,7 +364,7 @@ diff -u -p -r1.271 malloc.c
  	d = getpool();
  	if (d == NULL)
  		wrterror(d, "free() called before allocation");
-@@ -1486,6 +1777,11 @@ freezero(void *ptr, size_t sz)
+@@ -1600,6 +1829,11 @@ freezero(void *ptr, size_t sz)
  {
  	struct dir_info *d;
  	int saved_errno = errno;
@@ -403,7 +376,7 @@ diff -u -p -r1.271 malloc.c
  
  	/* This is legal. */
  	if (ptr == NULL)
-@@ -1501,6 +1797,16 @@ freezero(void *ptr, size_t sz)
+@@ -1615,6 +1849,16 @@ freezero(void *ptr, size_t sz)
  		wrterror(d, "freezero() called before allocation");
  	_MALLOC_LOCK(d->mutex);
  	d->func = "freezero";
@@ -411,7 +384,7 @@ diff -u -p -r1.271 malloc.c
 +#ifdef MALLOC_STATS
 +	if (mopts.malloc_trace) {
 +		trace.p = (uintptr_t)ptr;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("free", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +	}
@@ -420,7 +393,7 @@ diff -u -p -r1.271 malloc.c
  	if (d->active++) {
  		malloc_recurse(d);
  		return;
-@@ -1512,6 +1818,13 @@ freezero(void *ptr, size_t sz)
+@@ -1626,6 +1870,13 @@ freezero(void *ptr, size_t sz)
  }
  DEF_WEAK(freezero);
  
@@ -434,23 +407,13 @@ diff -u -p -r1.271 malloc.c
  static void *
  orealloc(struct dir_info **argpool, void *p, size_t newsz, void *f)
  {
-@@ -1680,6 +1993,7 @@ done:
- 		pool->func = saved_function;
- 		*argpool = pool;
- 	}
-+
- 	return ret;
- }
- 
-@@ -1688,11 +2002,29 @@ realloc(void *ptr, size_t size)
- {
+@@ -1804,10 +2055,28 @@ realloc(void *ptr, size_t size)
  	struct dir_info *d;
  	void *r;
--	int saved_errno = errno;
+ 	int saved_errno = errno;
 +#ifdef MALLOC_STATS
 +	struct realloc_trace trace;
 +	uintptr_t *bt = trace.bt;
-+	int saved_errno;
 +#endif
  
  	PROLOGUE(getpool(), "realloc")
@@ -463,7 +426,7 @@ diff -u -p -r1.271 malloc.c
 +		trace.p = (uintptr_t)r;
 +		trace.origp = (uintptr_t)ptr;
 +		trace.sz = size;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("realloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -473,19 +436,18 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  /*DEF_STRONG(realloc);*/
-@@ -1708,7 +2040,11 @@ calloc(size_t nmemb, size_t size)
- {
+@@ -1824,6 +2093,10 @@ calloc(size_t nmemb, size_t size)
  	struct dir_info *d;
  	void *r;
-+#ifdef MALLOC_STATS
  	int saved_errno = errno;
++#ifdef MALLOC_STATS
 +	struct malloc_trace trace;
 +	uintptr_t *bt = trace.bt;
 +#endif
  
  	PROLOGUE(getpool(), "calloc")
  	if ((nmemb >= MUL_NO_OVERFLOW || size >= MUL_NO_OVERFLOW) &&
-@@ -1724,6 +2060,19 @@ calloc(size_t nmemb, size_t size)
+@@ -1839,6 +2112,19 @@ calloc(size_t nmemb, size_t size)
  	size *= nmemb;
  	r = omalloc(d, size, 1, CALLER);
  	EPILOGUE()
@@ -495,7 +457,7 @@ diff -u -p -r1.271 malloc.c
 +		saved_errno = errno;
 +		trace.p = (uintptr_t)r;
 +		trace.sz = size;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("malloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -505,19 +467,18 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  /*DEF_STRONG(calloc);*/
-@@ -1733,7 +2082,11 @@ calloc_conceal(size_t nmemb, size_t size
- {
+@@ -1849,6 +2135,10 @@ calloc_conceal(size_t nmemb, size_t size
  	struct dir_info *d;
  	void *r;
-+#ifdef MALLOC_STATS
  	int saved_errno = errno;
++#ifdef MALLOC_STATS
 +	struct malloc_trace trace;
 +	uintptr_t *bt = trace.bt;
 +#endif
  
  	PROLOGUE(mopts.malloc_pool[0], "calloc_conceal")
  	if ((nmemb >= MUL_NO_OVERFLOW || size >= MUL_NO_OVERFLOW) &&
-@@ -1749,6 +2102,19 @@ calloc_conceal(size_t nmemb, size_t size
+@@ -1864,6 +2154,19 @@ calloc_conceal(size_t nmemb, size_t size
  	size *= nmemb;
  	r = omalloc(d, size, 1, CALLER);
  	EPILOGUE()
@@ -527,7 +488,7 @@ diff -u -p -r1.271 malloc.c
 +		saved_errno = errno;
 +		trace.p = (uintptr_t)r;
 +		trace.sz = size;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("malloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -537,20 +498,18 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  DEF_WEAK(calloc_conceal);
-@@ -1865,7 +2231,11 @@ recallocarray(void *ptr, size_t oldnmemb
- 	struct dir_info *d;
+@@ -1981,6 +2284,10 @@ recallocarray(void *ptr, size_t oldnmemb
  	size_t oldsize = 0, newsize;
  	void *r;
--	int saved_errno = errno;
+ 	int saved_errno = errno;
 +#ifdef MALLOC_STATS
 +	struct realloc_trace trace;
 +	uintptr_t *bt = trace.bt;
-+	int saved_errno;
 +#endif
  
  	if (!mopts.internal_funcs)
  		return recallocarray_p(ptr, oldnmemb, newnmemb, size);
-@@ -1896,6 +2266,20 @@ recallocarray(void *ptr, size_t oldnmemb
+@@ -2011,6 +2318,20 @@ recallocarray(void *ptr, size_t oldnmemb
  
  	r = orecallocarray(&d, ptr, oldsize, newsize, CALLER);
  	EPILOGUE()
@@ -561,7 +520,7 @@ diff -u -p -r1.271 malloc.c
 +		trace.p = (uintptr_t)r;
 +		trace.origp = (uintptr_t)ptr;
 +		trace.sz = newsize;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("realloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -571,7 +530,7 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  DEF_WEAK(recallocarray);
-@@ -2042,8 +2426,12 @@ void *
+@@ -2157,8 +2478,12 @@ void *
  aligned_alloc(size_t alignment, size_t size)
  {
  	struct dir_info *d;
@@ -585,7 +544,7 @@ diff -u -p -r1.271 malloc.c
  
  	/* Make sure that alignment is a positive power of 2. */
  	if (((alignment - 1) & alignment) != 0 || alignment == 0) {
-@@ -2059,6 +2447,19 @@ aligned_alloc(size_t alignment, size_t s
+@@ -2174,6 +2499,19 @@ aligned_alloc(size_t alignment, size_t s
  	PROLOGUE(getpool(), "aligned_alloc")
  	r = omemalign(d, alignment, size, 0, CALLER);
  	EPILOGUE()
@@ -595,7 +554,7 @@ diff -u -p -r1.271 malloc.c
 +		saved_errno = errno;
 +		trace.p = (uintptr_t)r;
 +		trace.sz = size;
-+		bt = omalloc_fillbt(bt, mopts.malloc_trace == 1 ?
++		bt = omalloc_backtrace(bt, mopts.malloc_trace == 1 ?
 +		    1 : sizeof(trace.bt) / sizeof(trace.bt[0]));
 +		utrace("malloc", &trace, (uintptr_t)bt - (uintptr_t)&(trace));
 +		errno = saved_errno;
@@ -605,12 +564,11 @@ diff -u -p -r1.271 malloc.c
  	return r;
  }
  /*DEF_STRONG(aligned_alloc);*/
-@@ -2300,6 +2701,7 @@ malloc_exit(void)
- {
- 	int save_errno = errno, fd, i;
+@@ -2426,6 +2764,7 @@ malloc_exit(void)
+ 	int save_errno = errno, fd;
+ 	unsigned i;
  
 +	return;
  	fd = open("malloc.out", O_RDWR|O_APPEND);
  	if (fd != -1) {
  		dprintf(fd, "******** Start dump %s *******\n", __progname);
-

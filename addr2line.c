@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "libelftc.h"
 
@@ -732,6 +733,8 @@ addr2line(const char *object, uintptr_t addr, char **name)
 
 	if (dwarf_init(fd, DW_DLC_READ, NULL, NULL, &dbg, &de))
 		errx(EXIT_FAILURE, "dwarf_init: %s", dwarf_errmsg(de));
+
+	close(fd);
 
 	if (dwarf_get_elf(dbg, &e, &de) != DW_DLV_OK)
 		errx(EXIT_FAILURE, "dwarf_get_elf: %s", dwarf_errmsg(de));
