@@ -8,7 +8,7 @@ First step is to apply the diff to `src/lib/libc/stdlib/malloc.c`, recompile and
 $ cd /usr/src/lib/libc
 $ patch < malloc.diff
 $ make obj
-$ make
+$ MALLOC_STATS=1 make
 $ doas make install
 ```
 After this, malloc will generate `utrace(2)` records when instructed to do so.
