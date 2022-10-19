@@ -198,7 +198,7 @@ main(int argc, char *argv[])
 	printf("Total memory leaked: %zu\n", mcur);
 	printf("Maximum memory: %zu\n", mmax);
 		
-	exit(0);
+	return(0);
 }
 
 static int
