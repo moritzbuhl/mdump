@@ -385,6 +385,26 @@ ktruser(struct ktr_user *usr, size_t len)
 		mptr->p = newptr;
 		mptr->obj[0] = obj;
 		mptr->obj[1] = NULL;
+
+		for (i = 1; len > 0; i++) {
+			if (i >= 200)
+				errx(1, "stack trace too long");
+
+			memcpy(&(osearch.f), u, sizeof(osearch.f));
+			mptr->obj[i] = RB_FIND(objectshead, &objects, &osearch);
+			if (mptr->obj[i] == NULL) {
+				obj = xmalloc(sizeof(*obj));
+				obj->f = osearch.f;
+				memcpy(obj->fname, "???", 3);
+				asprintf(&obj->sname, "%#010lx at ?", osearch.f);
+				RB_INSERT(objectshead, &objects, obj);
+				mptr->obj[i] = obj;
+			}
+			mptr->obj[i + 1] = NULL;
+			u += sizeof(osearch.f);
+			len -= sizeof(osearch.f);
+		}
+
 		if ((m = RB_INSERT(mallocshead, &mallocs, mptr)) != NULL) {
 			fprintf(stderr, "Duplicate realloc found at:\n");
 			for (i = 0; mptr->obj[i] != NULL; i++)
