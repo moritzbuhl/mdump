@@ -57,10 +57,11 @@ struct object {
 	RB_ENTRY(object) entry;
 };
 
+#define	MAX_STACK	200
 struct malloc {
 	uintptr_t p;
 	size_t size;
-	struct object *obj[200];
+	struct object *obj[MAX_STACK];
 	RB_ENTRY(malloc) entry;
 };
 
@@ -88,6 +89,7 @@ static int fread_tail(void *, size_t, size_t);
 static void ktruser(struct ktr_user *, size_t);
 static void usage(void);
 static void *xmalloc(size_t);
+static void append_objs(struct malloc *, uint8_t *, size_t);
 RB_PROTOTYPE_STATIC(objectshead, object, entry, objectcmp)
 RB_PROTOTYPE_STATIC(mallocshead, malloc, entry, malloccmp)
 
@@ -301,24 +303,8 @@ ktruser(struct ktr_user *usr, size_t len)
 		memcpy(&mptr->size, u, sizeof(mptr->size));
 		u += sizeof(mptr->size);
 		len -= sizeof(mptr->size);
-		for (i = 0; len > 0; i++) {
-			if (i >= 200)
-				errx(1, "stack trace too long");
 
-			memcpy(&(osearch.f), u, sizeof(osearch.f));
-			mptr->obj[i] = RB_FIND(objectshead, &objects, &osearch);
-			if (mptr->obj[i] == NULL) {
-				obj = xmalloc(sizeof(*obj));
-				obj->f = osearch.f;
-				memcpy(obj->fname, "???", 3);
-				asprintf(&obj->sname, "%#010lx at ?", osearch.f);
-				RB_INSERT(objectshead, &objects, obj);
-				mptr->obj[i] = obj;
-			}
-			mptr->obj[i + 1] = NULL;
-			u += sizeof(osearch.f);
-			len -= sizeof(osearch.f);
-		}
+		append_objs(mptr, u, len);
 
 		if ((m = RB_INSERT(mallocshead, &mallocs, mptr)) != NULL) {
 			fprintf(stderr, "Duplicate malloc found at (%p):\n",
@@ -358,6 +344,7 @@ ktruser(struct ktr_user *usr, size_t len)
 
 		memcpy(&(osearch.f), u, sizeof(osearch.f));
 		obj = RB_FIND(objectshead, &objects, &osearch);
+
 		if (msearch.p != 0) {
 			if ((mptr = RB_FIND(mallocshead, &mallocs,
 			    &msearch)) == NULL) {
@@ -383,27 +370,8 @@ ktruser(struct ktr_user *usr, size_t len)
 			mmax = mcur;
 		mptr->size = size;
 		mptr->p = newptr;
-		mptr->obj[0] = obj;
-		mptr->obj[1] = NULL;
 
-		for (i = 1; len > 0; i++) {
-			if (i >= 200)
-				errx(1, "stack trace too long");
-
-			memcpy(&(osearch.f), u, sizeof(osearch.f));
-			mptr->obj[i] = RB_FIND(objectshead, &objects, &osearch);
-			if (mptr->obj[i] == NULL) {
-				obj = xmalloc(sizeof(*obj));
-				obj->f = osearch.f;
-				memcpy(obj->fname, "???", 3);
-				asprintf(&obj->sname, "%#010lx at ?", osearch.f);
-				RB_INSERT(objectshead, &objects, obj);
-				mptr->obj[i] = obj;
-			}
-			mptr->obj[i + 1] = NULL;
-			u += sizeof(osearch.f);
-			len -= sizeof(osearch.f);
-		}
+		append_objs(mptr, u, len);
 
 		if ((m = RB_INSERT(mallocshead, &mallocs, mptr)) != NULL) {
 			fprintf(stderr, "Duplicate realloc found at:\n");
@@ -461,6 +429,34 @@ xmalloc(size_t sz)
 	if (p == NULL)
 		err(1, NULL);
 	return p;
+}
+
+static void
+append_objs(struct malloc *mptr, uint8_t *ktr_usr, size_t ktr_len)
+{
+	int i;
+	struct object *obj, osearch;
+
+	for (i = 0; ktr_len > 0; i++) {
+		if (i >= MAX_STACK) {
+			warnx("stack trace too long");
+			return;
+		}
+
+		memcpy(&(osearch.f), ktr_usr, sizeof(osearch.f));
+		mptr->obj[i] = RB_FIND(objectshead, &objects, &osearch);
+		if (mptr->obj[i] == NULL) {
+			obj = xmalloc(sizeof(*obj));
+			obj->f = osearch.f;
+			memcpy(obj->fname, "???", 3);
+			asprintf(&obj->sname, "%#010lx at ?", osearch.f);
+			RB_INSERT(objectshead, &objects, obj);
+			mptr->obj[i] = obj;
+		}
+		mptr->obj[i + 1] = NULL;
+		ktr_usr += sizeof(osearch.f);
+		ktr_len -= sizeof(osearch.f);
+	}
 }
 
 RB_GENERATE_STATIC(objectshead, object, entry, objectcmp);
