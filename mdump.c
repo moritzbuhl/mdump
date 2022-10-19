@@ -65,13 +65,6 @@ struct malloc {
 	RB_ENTRY(malloc) entry;
 };
 
-enum {
-	TIMESTAMP_NONE,
-	TIMESTAMP_ABSOLUTE,
-	TIMESTAMP_RELATIVE,
-	TIMESTAMP_ELAPSED
-} timestamp = TIMESTAMP_NONE;
-
 int tail, dump;
 char *tracefile = "ktrace.out";
 char *malloc_aout = "a.out";
