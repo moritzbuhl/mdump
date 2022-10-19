@@ -301,12 +301,21 @@ ktruser(struct ktr_user *usr, size_t len)
 		memcpy(&mptr->size, u, sizeof(mptr->size));
 		u += sizeof(mptr->size);
 		len -= sizeof(mptr->size);
-		for (i = 0; len > 0;) {
+		for (i = 0; len > 0; i++) {
+			if (i >= 200)
+				errx(1, "stack trace too long");
+
 			memcpy(&(osearch.f), u, sizeof(osearch.f));
 			mptr->obj[i] = RB_FIND(objectshead, &objects, &osearch);
-			if (mptr->obj[i] != NULL)
-				i++;
-			mptr->obj[i] = NULL;
+			if (mptr->obj[i] == NULL) {
+				obj = xmalloc(sizeof(*obj));
+				obj->f = osearch.f;
+				memcpy(obj->fname, "???", 3);
+				asprintf(&obj->sname, "%#010lx at ?", osearch.f);
+				RB_INSERT(objectshead, &objects, obj);
+				mptr->obj[i] = obj;
+			}
+			mptr->obj[i + 1] = NULL;
 			u += sizeof(osearch.f);
 			len -= sizeof(osearch.f);
 		}
