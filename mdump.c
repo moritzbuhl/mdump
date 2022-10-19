@@ -65,6 +65,13 @@ struct malloc {
 	RB_ENTRY(malloc) entry;
 };
 
+struct addrline {
+	uintptr_t a;
+	char fname[PATH_MAX];
+	char *sname;
+	RB_ENTRY(addrline) entry;
+};
+
 int tail, dump;
 char *tracefile = "ktrace.out";
 char *malloc_aout = "a.out";
@@ -76,6 +83,7 @@ int verbose = 0;
 size_t mcur = 0, mmax = 0, mtrigger = 0;
 RB_HEAD(objectshead, object) objects = RB_INITIALIZER(&objects);
 RB_HEAD(mallocshead, malloc) mallocs = RB_INITIALIZER(&mallocs);
+RB_HEAD(addrlineshead, addrline) addrlines = RB_INITIALIZER(&addrlines);
 
 static int fread_tail(void *, size_t, size_t);
 
@@ -83,8 +91,10 @@ static void ktruser(struct ktr_user *, size_t);
 static void usage(void);
 static void *xmalloc(size_t);
 static void append_objs(struct malloc *, uint8_t *, size_t);
+
 RB_PROTOTYPE_STATIC(objectshead, object, entry, objectcmp)
 RB_PROTOTYPE_STATIC(mallocshead, malloc, entry, malloccmp)
+RB_PROTOTYPE_STATIC(addrlineshead, addrline, entry, addrlinecmp)
 
 int
 main(int argc, char *argv[])
@@ -224,6 +234,14 @@ malloccmp(const struct malloc *m1, const struct malloc *m2)
 	return m1->p < m2->p ? -1 : m1->p > m2->p;
 }
 
+static int
+addrlinecmp(const struct addrline *l1, const struct addrline *l2)
+{
+	if (l1->a == l2->a)
+		return strcmp(l1->fname, l2->fname);
+	return l1->a < l2->a ? -1 : l1->a > l2->a;
+}
+
 void addr2line(const char *object, uintptr_t addr, char **name);
 
 static void
@@ -262,6 +280,8 @@ ktruser(struct ktr_user *usr, size_t len)
 	}
 
 	if (strcmp(usr->ktr_id, "malloctrobject") == 0) {
+		struct addrline *addrline, asearch;
+		char *fname;
 		uintptr_t offptr;
 
 		memcpy(&(osearch.f), u, sizeof(osearch.f));
@@ -280,8 +300,20 @@ ktruser(struct ktr_user *usr, size_t len)
 		}
 		memcpy(obj->fname, u, len);
 		obj->fname[len] = '\0';
-		addr2line(len == 0 ? malloc_aout : obj->fname, offptr,
-		    &(obj->sname));
+		fname = (len == 0 ? malloc_aout : obj->fname);
+
+		asearch.a = offptr;
+		strcpy(asearch.fname, fname);
+		addrline = RB_FIND(addrlineshead, &addrlines, &asearch);
+		if (addrline == NULL) {
+			addrline = xmalloc(sizeof(*addrline));
+			addrline->a = offptr;
+			strcpy(addrline->fname, asearch.fname);
+			addr2line(fname, offptr, &(addrline->sname));
+			RB_INSERT(addrlineshead, &addrlines, addrline);
+		} else
+			strcpy(obj->sname, addrline->sname);
+
 		RB_INSERT(objectshead, &objects, obj);
 		return;
 	}
@@ -454,3 +486,4 @@ append_objs(struct malloc *mptr, uint8_t *ktr_usr, size_t ktr_len)
 
 RB_GENERATE_STATIC(objectshead, object, entry, objectcmp);
 RB_GENERATE_STATIC(mallocshead, malloc, entry, malloccmp);
+RB_GENERATE_STATIC(addrlineshead, addrline, entry, addrlinecmp);
