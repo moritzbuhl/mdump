@@ -301,7 +301,7 @@ ktruser(struct ktr_user *usr, size_t len)
 		memcpy(&mptr->size, u, sizeof(mptr->size));
 		u += sizeof(mptr->size);
 		len -= sizeof(mptr->size);
-		for (i = 0; len > 0; i++) {
+		for (i = 0; len > 0;) {
 			memcpy(&(osearch.f), u, sizeof(osearch.f));
 			mptr->obj[i] = RB_FIND(objectshead, &objects, &osearch);
 			if (mptr->obj[i] != NULL)
